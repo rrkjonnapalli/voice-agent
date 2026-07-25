@@ -1,0 +1,25 @@
+[project]
+name = "voice-agent"
+version = "0.1.0"
+description = "A local, real-time, interruptible speech-to-speech voice agent"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.139.0",
+    "misaki[en]>=0.9.4",
+    "mlx-audio",
+    "num2words>=0.5.14",
+    "numpy>=2.2.6",
+    "openai>=2.44.0",
+    "pyaec>=1.0.1",
+    "scipy>=1.15.3",
+    "silero-vad>=6.2.1",
+    "sounddevice>=0.5.5",
+    "soundfile>=0.14.0",
+    "torch>=2.12.1",
+    "uvicorn[standard]>=0.50.2",
+    "websockets>=16.0",
+]
+
+[tool.uv.sources]
+mlx-audio = { git = "https://github.com/Blaizzy/mlx-audio.git" }
