@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Voice Agent</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      max-width: 480px;
+      margin: 4rem auto;
+      text-align: center;
+      color: #222;
+    }
+    button {
+      font-size: 1.1rem;
+      padding: 0.75rem 2rem;
+      margin: 0.5rem;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      color: white;
+    }
+    #startBtn { background: #2563eb; }
+    #stopBtn { background: #dc2626; }
+    button:disabled { background: #ccc; cursor: not-allowed; }
+    #status { margin-top: 1.5rem; color: #666; }
+  </style>
+</head>
+<body>
+  <h1>Voice Agent</h1>
+  <button id="startBtn">Start</button>
+  <button id="stopBtn" disabled>Stop</button>
+  <div id="status">Not connected</div>
+
+  <script>
+    // -- must match core/constants.py on the server --
+    const IP_SAMPLE_RATE = 16000; // mic capture rate the server expects
+    const OP_SAMPLE_RATE = 24000; // TTS playback rate the server sends
+    const MIC_BUFFER_SIZE = 4096; // ScriptProcessorNode buffer size -- doesn't need to
+                                   // match the server's 512-sample VAD window; server_ip.py's
+                                   // AudioReceiver already re-chunks whatever arrives into that
+
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const statusEl = document.getElementById('status');
+
+    let ws = null;
+    let micStream = null;
+    let micContext = null;
+    let micProcessor = null;
+    let playbackContext = null;
+    let nextPlayTime = 0;
+    let activeSources = [];
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    // Simple linear-interpolation resample -- used only if the browser
+    // doesn't actually honor the requested 16kHz AudioContext sample rate
+    // (this varies by browser/OS, worth verifying directly rather than
+    // trusting the constructor option always works). Per-chunk, not
+    // continuous -- fine here since this feeds STT, which is robust to a
+    // tiny discontinuity every ~100ms, unlike the AEC reference-signal case
+    // (see ref.md) where that kind of seam mattered a lot more.
+    function resampleLinear(input, fromRate, toRate) {
+      if (fromRate === toRate) return input;
+      const ratio = fromRate / toRate;
+      const outLength = Math.floor(input.length / ratio);
+      const output = new Float32Array(outLength);
+      for (let i = 0; i < outLength; i++) {
+        const srcPos = i * ratio;
+        const idx = Math.floor(srcPos);
+        const frac = srcPos - idx;
+        const a = input[idx] || 0;
+        const b = input[idx + 1] !== undefined ? input[idx + 1] : a;
+        output[i] = a + (b - a) * frac;
+      }
+      return output;
+    }
+
+    async function startMic() {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micContext = new AudioContext({ sampleRate: IP_SAMPLE_RATE });
+      const source = micContext.createMediaStreamSource(micStream);
+
+      // ScriptProcessorNode is deprecated in favor of AudioWorkletNode, but
+      // simpler (no separate worklet file / addModule() load step) and
+      // still works in every current browser -- a reasonable tradeoff here
+      micProcessor = micContext.createScriptProcessor(MIC_BUFFER_SIZE, 1, 1);
+
+      micProcessor.onaudioprocess = (event) => {
+        const raw = event.inputBuffer.getChannelData(0);
+        const resampled = resampleLinear(raw, micContext.sampleRate, IP_SAMPLE_RATE);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          // a Float32Array's underlying buffer is raw little-endian bytes,
+          // matching numpy's default on the platforms this runs on -- no
+          // explicit byte-order handling needed
+          ws.send(resampled.buffer);
+        }
+      };
+
+      // ScriptProcessorNode only fires onaudioprocess while connected to
+      // the destination (a real quirk of this deprecated API) -- routed
+      // through a zero-gain node so the raw mic signal doesn't also play
+      // back out the speakers
+      const silentGain = micContext.createGain();
+      silentGain.gain.value = 0;
+      source.connect(micProcessor);
+      micProcessor.connect(silentGain);
+      silentGain.connect(micContext.destination);
+    }
+
+    function stopMic() {
+      if (micProcessor) { micProcessor.disconnect(); micProcessor = null; }
+      if (micContext) { micContext.close(); micContext = null; }
+      if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+    }
+
+    // Schedules incoming TTS audio back-to-back for gapless playback using
+    // the AudioContext's own clock, rather than a fixed-size callback the
+    // way client.py's sounddevice OutputStream requires -- Web Audio
+    // handles that scheduling natively, no leftover-buffer bookkeeping needed.
+    function playChunk(arrayBuffer) {
+      const floatData = new Float32Array(arrayBuffer);
+      const buffer = playbackContext.createBuffer(1, floatData.length, OP_SAMPLE_RATE);
+      buffer.copyToChannel(floatData, 0);
+
+      const src = playbackContext.createBufferSource();
+      src.buffer = buffer;
+      src.connect(playbackContext.destination);
+
+      const now = playbackContext.currentTime;
+      const startTime = Math.max(now, nextPlayTime);
+      src.start(startTime);
+      nextPlayTime = startTime + buffer.duration;
+      activeSources.push(src);
+    }
+
+    // The interrupt signal from the server (see stages/server_op.py) --
+    // this is this client's equivalent of client.py's flush_event: stop
+    // everything currently playing or scheduled, immediately.
+    function flushPlayback() {
+      for (const src of activeSources) {
+        try { src.stop(); } catch (e) { /* already finished playing */ }
+      }
+      activeSources = [];
+      nextPlayTime = 0;
+    }
+
+    async function start() {
+      startBtn.disabled = true;
+      setStatus('Connecting...');
+
+      if (playbackContext) playbackContext.close();
+      playbackContext = new AudioContext({ sampleRate: OP_SAMPLE_RATE });
+      nextPlayTime = 0;
+
+      const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${protocol}://${location.host}/ws`);
+      ws.binaryType = 'arraybuffer'; // binary frames arrive as a Blob otherwise
+
+      ws.onopen = async () => {
+        try {
+          await startMic();
+          setStatus('Listening...');
+          stopBtn.disabled = false;
+        } catch (err) {
+          setStatus('Microphone access denied: ' + err.message);
+          ws.close();
+        }
+      };
+
+      ws.onmessage = (event) => {
+        if (typeof event.data === 'string') {
+          const msg = JSON.parse(event.data);
+          if (msg.event === 'interrupt') {
+            flushPlayback();
+          }
+        } else {
+          playChunk(event.data);
+        }
+      };
+
+      ws.onclose = () => {
+        setStatus('Not connected');
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        stopMic();
+      };
+
+      ws.onerror = () => {
+        setStatus('Connection error');
+      };
+    }
+
+    function stop() {
+      if (ws) ws.close();
+      stopMic();
+      if (playbackContext) { playbackContext.close(); playbackContext = null; }
+    }
+
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', stop);
+  </script>
+</body>
+</html>

@@ -19,8 +19,8 @@ STT_MODEL = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
 # --- llm.py ---
 LLM_BASE_URL = "http://localhost:11434/v1"  # Ollama's OpenAI-compatible endpoint
 LLM_API_KEY = "ollama"  # Ollama ignores the actual value, but the SDK requires one
-LLM_MODEL = 'laguna-xs-2.1'
-# laguna-xs-2.1 / lfm2.5 / north-mini-code-1.0:mlx-nvfp4
+LLM_MODEL = 'laguna-xs-2.1:nvfp4'
+# laguna-xs-2.1:nvfp4 / lfm2.5 / north-mini-code-1.0:mlx-nvfp4
 # LLM_MODEL = 'lfm2.5'
 LLM_SYSTEM_PROMPT = (
     'You are Ria. You are a smart assistant. Respond briefly and conversationally. Clean and simple responses are best. '

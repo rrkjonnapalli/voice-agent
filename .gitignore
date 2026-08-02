@@ -10,3 +10,7 @@ wheels/
 .venv
 recordings/
 use_*
+
+# local dev TLS cert -- self-signed, machine-specific (bakes in a LAN IP), never commit a private key
+key.pem
+cert.pem
